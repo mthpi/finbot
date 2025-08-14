@@ -28,10 +28,12 @@ def fetch_rate(date_iso, base, quote):
     return float(j["rates"][quote])
 
 @app.get("/")
+@app.get("/api/cron")
 def health():
     return {"ok": True}
 
 @app.post("/")
+@app.post("/api/cron")
 def run():
     BASE = os.environ.get("BASE_CURRENCY","RUB").upper()
     ws_tx, ws_rates = gclient()
