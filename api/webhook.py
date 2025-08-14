@@ -96,6 +96,10 @@ def ensure_rate(date_iso: str, base: str, quote: str) -> float:
     save_rate(date_iso, base, quote, r)
     return r
 
+@app.get("/")          # health-check для проверки в браузере
+def health():
+    return {"ok": True}
+
 @app.post("/")
 async def webhook(req: Request):
     upd = await req.json()
