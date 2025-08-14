@@ -20,13 +20,6 @@ def now_local_iso() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
 
 def parse_msg(text: str, base_currency: str):
-    """
-    Формат:
-      - расход:  -1200 kzt кофе #еда/кофе
-      - доход:   +3000 rub репетитор #доход/репетитор
-    Валюта опциональна (по умолчанию base_currency).
-    Категория через #тег: #еда или #еда/кофе.
-    """
     m = re.match(r"^\s*([+\-])\s*([\d.,]+)\s*([a-zA-Z]{3})?\s*(.*)$", text or "")
     if not m:
         return None
@@ -46,12 +39,17 @@ def parse_msg(text: str, base_currency: str):
         else:
             category = first
 
+    # Убираем все #теги, лишние пробелы — это и будет description
+    description = re.sub(r"#([^\s#]+)", "", rest).strip()
+
     return {
         "amount": amount,
         "currency": cur,
         "category": category,
-        "subcategory": subcategory
+        "subcategory": subcategory,
+        "description": description
     }
+
 
 def get_sheets():
     """Ленивая инициализация Google Sheets, берём секреты из ENV."""
@@ -122,11 +120,13 @@ async def webhook(req: Request):
             today_iso(),         # date
             round(p["amount"], 2),   # amount
             p["currency"],           # currency
-            "",                      # amount_base (посчитает крон)
+            "",                      # amount_base
             base,                    # base_currency
             p["category"],           # category
             p["subcategory"],        # subcategory
+            p["description"],        # description  ← вот сюда
         ]
+
         ws_tx.append_row(row)
     except Exception as e:
         # В логах Vercel будет видно, что именно пошло не так (права/ключ/имя листа)
