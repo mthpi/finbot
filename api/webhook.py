@@ -11,6 +11,7 @@ CURRENCIES = {"RUB","KZT","USD","EUR"}
 
 # ---------- health ----------
 @app.get("/")
+@app.get("/api/webhook")
 def health():
     return {"ok": True}
 
@@ -114,6 +115,7 @@ def ensure_rate(ws_rates, date_iso: str, base: str, quote: str) -> float:
 
 # ---------- webhook ----------
 @app.post("/")
+@app.get("/api/webhook")
 async def webhook(req: Request):
     # Инициализация env и Google Sheets
     try:
