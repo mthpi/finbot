@@ -96,7 +96,7 @@ def ensure_rate(date_iso: str, base: str, quote: str) -> float:
     save_rate(date_iso, base, quote, r)
     return r
 
-@app.post("/webhook")
+@app.post("/")
 async def webhook(req: Request):
     upd = await req.json()
     msg = upd.get("message") or upd.get("edited_message")
