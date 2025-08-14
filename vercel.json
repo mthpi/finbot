@@ -1,0 +1,9 @@
+{
+  "functions": {
+    "api/cron.py": { "runtime": "@vercel/python@3.11" },
+    "api/webhook.py": { "runtime": "@vercel/python@3.11" }
+  },
+  "crons": [
+    { "path": "/api/cron", "schedule": "*/15 * * * *" } 
+  ]
+}
