@@ -6,50 +6,30 @@ from google.oauth2.service_account import Credentials
 import gspread
 
 app = FastAPI()
-
-# ====== ENV (заполни на Vercel в переменных окружения) ======
-BOT_TOKEN = os.environ["BOT_TOKEN"]                 # НОВЫЙ токен бота (старый – отозвать в @BotFather)
-SHEET_ID = os.environ["SHEET_ID"]                   # ID таблицы (кусок между /d/ и /edit в URL)
-BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "RUB").upper()
-ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])  # твой Telegram user_id (узнаешь у @userinfobot)
-
-GCP_SA_EMAIL = os.environ["GCP_SA_EMAIL"]           # из JSON серв.аккаунта
-GCP_SA_PRIVATE_KEY = os.environ["GCP_SA_PRIVATE_KEY"].replace("\\n", "\n")  # из JSON (с переносами строк)
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
-creds = Credentials.from_service_account_info(
-    {"type":"service_account","client_email":GCP_SA_EMAIL,"private_key":GCP_SA_PRIVATE_KEY},
-    scopes=SCOPES
-)
-gc = gspread.authorize(creds)
-sh = gc.open_by_key(SHEET_ID)
-ws_tx = sh.worksheet("Transactions")
-ws_rates = sh.worksheet("Rates")
-
 TZ = pytz.timezone("Asia/Almaty")
 CURRENCIES = {"RUB","KZT","USD","EUR"}
+
+# ---------- health ----------
+@app.get("/")
+def health():
+    return {"ok": True}
+
+# ---------- utils ----------
+def today_iso():
+    return datetime.now(TZ).strftime("%Y-%m-%d")
 
 def now_local_iso():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
 
-def today_iso():
-    return datetime.now(TZ).strftime("%Y-%m-%d")
-
 def parse_msg(text: str, base_currency: str):
-    """
-    Ожидаемый формат сообщений боту:
-      - расход:  -1200 kzt кофе #еда/кофе
-      - доход:   +3000 rub репетитор #доход/репетитор
-    Валюта опциональна (если не указана — берём базовую RUB).
-    Категория задаётся хэштегом (#еда или #еда/кофе).
-    """
-    m = re.match(r"^\s*([+\-])\s*([\d.,]+)\s*([a-zA-Z]{3})?\s*(.*)$", text)
-    if not m: return None
+    m = re.match(r"^\s*([+\-])\s*([\d.,]+)\s*([a-zA-Z]{3})?\s*(.*)$", text or "")
+    if not m:
+        return None
     sign = -1 if m.group(1) == "-" else 1
     amount = sign * float(m.group(2).replace(",", "."))
     cur = (m.group(3) or base_currency).upper()
-    if cur not in CURRENCIES: return None
-
+    if cur not in CURRENCIES:
+        return None
     rest = m.group(4) or ""
     tags = re.findall(r"#([^\s#]+)", rest)
     category, subcategory = "", ""
@@ -59,84 +39,136 @@ def parse_msg(text: str, base_currency: str):
             category, subcategory = first.split("/", 1)
         else:
             category = first
-
     return {"amount": amount, "currency": cur, "category": category, "subcategory": subcategory}
 
-def get_rate_from_sheet(date_iso: str, base: str, quote: str):
-    if base == quote: return 1.0
-    # header: date | base | quote | rate
+def need_env(name, cast=str):
+    v = os.environ.get(name)
+    if v is None or v == "":
+        raise RuntimeError(f"MISSING_ENV:{name}")
+    return cast(v) if cast is not str else v
+
+def get_sheets():
+    """Ленивая инициализация клиентов Google; бросает читаемую ошибку вместо падения модуля."""
+    SHEET_ID = need_env("SHEET_ID")
+    GCP_SA_EMAIL = need_env("GCP_SA_EMAIL")
+    GCP_SA_PRIVATE_KEY = need_env("GCP_SA_PRIVATE_KEY").replace("\\n", "\n")
+
+    creds = Credentials.from_service_account_info(
+        {
+            "type": "service_account",
+            "client_email": GCP_SA_EMAIL,
+            "private_key": GCP_SA_PRIVATE_KEY,
+            "token_uri": "https://oauth2.googleapis.com/token"
+        },
+        scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws_tx = sh.worksheet("Transactions")
+    except gspread.WorksheetNotFound:
+        raise RuntimeError("SHEET_ERROR: лист 'Transactions' не найден")
+    try:
+        ws_rates = sh.worksheet("Rates")
+    except gspread.WorksheetNotFound:
+        raise RuntimeError("SHEET_ERROR: лист 'Rates' не найден")
+    return ws_tx, ws_rates
+
+def get_rate_from_sheet(ws_rates, date_iso: str, base: str, quote: str):
+    if base == quote:
+        return 1.0
     values = ws_rates.get_all_values()
     for row in values[1:]:
-        if len(row) < 4: continue
+        if len(row) < 4:
+            continue
         d, b, q, r = row[0], row[1], row[2], row[3]
         if d == date_iso and b.upper() == base and q.upper() == quote:
-            try: return float(r)
-            except: pass
+            try:
+                return float(r)
+            except:
+                pass
     return None
 
-def save_rate(date_iso: str, base: str, quote: str, rate: float):
-    ws_rates.append_row([date_iso, base, quote, f"{rate:.6f}"])
-
 def fetch_rate(date_iso: str, base: str, quote: str) -> float:
-    if base == quote: return 1.0
+    if base == quote:
+        return 1.0
     url = f"https://api.exchangerate.host/{date_iso}?base={base}&symbols={quote}"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
     j = r.json()
     rate = j.get("rates", {}).get(quote)
-    if not rate: raise RuntimeError("rate not found")
+    if not rate:
+        raise RuntimeError("RATE_API_ERROR")
     return float(rate)
 
-def ensure_rate(date_iso: str, base: str, quote: str) -> float:
-    """В листе Rates храним курс base->quote на дату.
-       Для пересчёта quote->base используем 1/rate."""
-    r = get_rate_from_sheet(date_iso, base, quote)
-    if r is not None: return r
+def ensure_rate(ws_rates, date_iso: str, base: str, quote: str) -> float:
+    r = get_rate_from_sheet(ws_rates, date_iso, base, quote)
+    if r is not None:
+        return r
     r = fetch_rate(date_iso, base, quote)
-    save_rate(date_iso, base, quote, r)
+    ws_rates.append_row([date_iso, base, quote, f"{r:.6f}"])
     return r
 
-@app.get("/")          # health-check для проверки в браузере
-def health():
-    return {"ok": True}
-
+# ---------- webhook ----------
 @app.post("/")
 async def webhook(req: Request):
-    upd = await req.json()
-    msg = upd.get("message") or upd.get("edited_message")
-    if not msg or "text" not in msg: return Response("ok")
+    try:
+        BASE_CURRENCY = os.environ.get("BASE_CURRENCY", "RUB").upper()
+        allowed_id_env = os.environ.get("ALLOWED_USER_ID")
+        ALLOWED_ID = int(allowed_id_env) if allowed_id_env else None
+        ws_tx, ws_rates = get_sheets()
+    except Exception as e:
+        return Response(f"INIT_ERROR:{e}", status_code=500)
 
-    # Разрешаем писать только твоему ID
-    if msg.get("from", {}).get("id") != ALLOWED_USER_ID:
+    try:
+        upd = await req.json()
+    except Exception:
+        return Response("bad json", status_code=400)
+
+    msg = (upd.get("message") or upd.get("edited_message")) or {}
+    text = msg.get("text")
+    from_id = (msg.get("from") or {}).get("id")
+
+    if ALLOWED_ID and from_id != ALLOWED_ID:
         return Response("ok")
 
-    text = msg["text"].strip()
     parsed = parse_msg(text, BASE_CURRENCY)
-    if not parsed:  # неверный формат — молча игнорируем
+    if not parsed:
         return Response("ok")
 
     date_iso = today_iso()
     amount = parsed["amount"]
     cur = parsed["currency"]
-    # получаем rate base->quote; для amount в quote нам нужно quote->base = 1/rate
-    if cur == BASE_CURRENCY:
-        amount_base = amount
-    else:
-        r = ensure_rate(date_iso, BASE_CURRENCY, cur)
-        amount_base = amount * (1.0 / r)
+
+    try:
+        if cur == BASE_CURRENCY:
+            amount_base = amount
+            rate_used = 1.0
+        else:
+            r = ensure_rate(ws_rates, date_iso, BASE_CURRENCY, cur)   # r = base->quote
+            amount_base = amount * (1.0 / r)                          # quote->base
+            rate_used = round(1.0 / r, 6)
+    except Exception as e:
+        return Response(f"RATE_ERROR:{e}", status_code=500)
 
     row = [
-        str(uuid.uuid4()),   # id
-        now_local_iso(),     # timestamp_local
-        date_iso,            # date
-        round(amount, 2),    # amount (в исходной валюте)
-        cur,                 # currency
-        round(amount_base, 2), # amount_base (в RUB)
-        BASE_CURRENCY,       # base_currency
-        parsed["category"],  # category
-        parsed["subcategory"]# subcategory
+        str(uuid.uuid4()),     # id
+        now_local_iso(),       # timestamp_local
+        date_iso,              # date
+        round(amount, 2),      # amount
+        cur,                   # currency
+        round(amount_base, 2), # amount_base
+        BASE_CURRENCY,         # base_currency
+        parsed["category"],    # category
+        parsed["subcategory"]  # subcategory
     ]
-    ws_tx.append_row(row)
 
-    # бот ничего не пишет в ответ
+    try:
+        ws_tx.append_row(row)
+    except Exception as e:
+        return Response(f"SHEETS_WRITE_ERROR:{e}", status_code=500)
+
     return Response("ok")
